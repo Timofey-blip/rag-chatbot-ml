@@ -11,10 +11,7 @@ RAG Чат-бот (Retrieval-Augmented Generation)
 
 import chromadb
 from chromadb.utils import embedding_functions
-from langchain_community.llms import Ollama
-from langchain_core.prompts import ChatPromptTemplate
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain.chains import create_retrieval_chain
+import ollama
 
 # ============================================================
 # ЧАСТЬ 1: ВЕКТОРНАЯ БАЗА ДАННЫХ (ChromaDB)
@@ -28,7 +25,6 @@ print("=" * 60)
 client = chromadb.PersistentClient(path="./chroma_db")
 
 # 1.2. Функция для автоматического создания эмбеддингов
-# Используем модель all-MiniLM-L6-v2 (быстрая и легкая)
 embedding_func = embedding_functions.SentenceTransformerEmbeddingFunction(
     model_name="all-MiniLM-L6-v2"
 )
@@ -39,14 +35,13 @@ collection = client.get_or_create_collection(
     embedding_function=embedding_func
 )
 
-print(f"✅ Коллекция '{collection.name}' готова")
-print(f"📊 В базе сейчас {collection.count()} документов")
+print(f"Коллекция '{collection.name}' готова")
+print(f"В базе сейчас {collection.count()} документов")
 
 # 1.4. Если коллекция пустая, добавляем тестовые данные
 if collection.count() == 0:
-    print("\n Добавляем тестовые документы в базу...")
+    print("\nДобавляем тестовые документы в базу...")
     
-    # База знаний по машинному обучению
     documents = [
         "Машинное обучение (ML) — это подраздел искусственного интеллекта, изучающий методы построения алгоритмов, способных обучаться на данных.",
         "Градиентный спуск — это алгоритм оптимизации, который шаг за шагом изменяет веса модели для минимизации функции потерь.",
@@ -74,7 +69,6 @@ if collection.count() == 0:
         "Температура (Temperature) в LLM контролирует случайность ответов. Низкая температура (0.1-0.3) для фактов, высокая (0.7-1.0) для креатива."
     ]
     
-    # Метаданные для каждого документа
     metadatas = [
         {"category": "ml_basics", "topic": "definition"},
         {"category": "optimization", "topic": "algorithm"},
@@ -102,94 +96,120 @@ if collection.count() == 0:
         {"category": "rag", "topic": "temperature"}
     ]
     
-    # Уникальные ID для документов
     ids = [f"doc_{i}" for i in range(len(documents))]
     
-    # Добавляем всё в базу
     collection.add(
         documents=documents,
         metadatas=metadatas,
         ids=ids
     )
     
-    print(f"✅ Добавлено {len(documents)} документов в базу")
+    print(f"Добавлено {len(documents)} документов в базу")
 else:
-    print(" База данных уже содержит документы")
+    print("База данных уже содержит документы")
 
-# 1.5. Создаем поисковик (retriever)
-# k=2 означает, что будем искать 2 ближайших соседа
-retriever = collection.as_retriever(search_kwargs={"k": 2})
-
-print("\n✅ Векторная база данных готова к работе")
+print("\nВекторная база данных готова к работе")
 
 # ============================================================
-# ЧАСТЬ 2: ПОДКЛЮЧЕНИЕ LLM (Ollama)
+# ЧАСТЬ 2: ПРОВЕРКА OLLAMA
 # ============================================================
 
 print("\n" + "=" * 60)
-print("Подключение языковой модели (LLM)...")
+print("Проверка Ollama...")
 print("=" * 60)
 
-# Инициализируем локальную LLM через Ollama
-# Используем Qwen 2.5 (1.5B параметров) — быстрая и качественная
-llm = Ollama(model="qwen2.5:1.5b", temperature=0.1)
-
-print("✅ LLM загружена и готова к работе")
-print("💡 Модель: Qwen 2.5 (1.5B)")
-print("🌡️ Температура: 0.1 (низкая для точных ответов)")
+try:
+    # Проверяем, что Ollama запущена
+    ollama.list()
+    print("Ollama работает!")
+    
+    # Проверяем, что модель скачана
+    models = ollama.list()
+    model_names = [m['model'] for m in models['models']]
+    
+    if 'qwen2.5:1.5b' in model_names:
+        print("Модель qwen2.5:1.5b найдена")
+    else:
+        print("Модель qwen2.5:1.5b не найдена. Скачиваю...")
+        print("Это может занять 5-10 минут...")
+        ollama.pull('qwen2.5:1.5b')
+        print("Модель скачана!")
+        
+except Exception as e:
+    print(f"Ошибка: {e}")
+    print("\nУбедись, что:")
+    print("1. Ollama установлена (скачай с https://ollama.com/)")
+    print("2. Ollama запущена (открой программу)")
+    print("3. Модель скачана: ollama pull qwen2.5:1.5b")
+    input("\nНажми Enter для выхода...")
+    exit()
 
 # ============================================================
-# ЧАСТЬ 3: СОЗДАНИЕ RAG-ЦЕПОЧКИ
+# ЧАСТЬ 3: ФУНКЦИЯ ПОИСКА В БАЗЕ
 # ============================================================
 
-print("\n" + "=" * 60)
-print("Создание RAG-цепочки...")
-print("=" * 60)
+def search_documents(query, k=2):
+    """Ищет k ближайших документов по запросу"""
+    results = collection.query(
+        query_texts=[query],
+        n_results=k
+    )
+    return results['documents'][0]
 
-# Системный промпт — инструкция для LLM
-# Этот промпт запрещает модели галлюцинировать
-system_prompt = """Ты полезный ассистент для ответов на вопросы по машинному обучению и искусственному интеллекту.
+# ============================================================
+# ЧАСТЬ 4: ФУНКЦИЯ ГЕНЕРАЦИИ ОТВЕТА
+# ============================================================
+
+def generate_answer(question, context_documents):
+    """Генерирует ответ на основе контекста"""
+    
+    # Формируем контекст из найденных документов
+    context = "\n\n".join(context_documents)
+    
+    # Системный промпт
+    system_prompt = """Ты полезный ассистент для ответов на вопросы по машинному обучению и искусственному интеллекту.
 
 ПРАВИЛА:
 1. Отвечай ТОЛЬКО на основе предоставленного контекста
 2. Если ответа в контексте нет, так и скажи: "Я не нашел эту информацию в документах"
 3. Отвечай на русском языке
 4. Будь краток и конкретен
-5. Если возможно, приводи примеры
-
-КОНТЕКСТ:
+5. Если возможно, приводи примеры"""
+    
+    # Пользовательский промпт
+    user_prompt = f"""КОНТЕКСТ:
 {context}
 
 ВОПРОС ПОЛЬЗОВАТЕЛЯ:
-{input}"""
-
-# Создаем шаблон промпта
-prompt = ChatPromptTemplate.from_messages([
-    ("system", system_prompt),
-])
-
-# Собираем цепочку: Документы + Промпт → LLM → Ответ
-question_answer_chain = create_stuff_documents_chain(llm, prompt)
-
-# Финальная RAG-цепочка: Вопрос → Поиск → Контекст → Ответ
-rag_chain = create_retrieval_chain(retriever, question_answer_chain)
-
-print("✅ RAG-система полностью готова!")
-print("🔄 Цепочка: Вопрос → Эмбеддинг → Поиск (k-NN) → Контекст → LLM → Ответ")
+{question}"""
+    
+    # Вызываем Ollama
+    response = ollama.chat(
+        model='qwen2.5:1.5b',
+        messages=[
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': user_prompt}
+        ],
+        options={
+            'temperature': 0.1
+        }
+    )
+    
+    return response['message']['content']
 
 # ============================================================
-# ЧАСТЬ 4: ИНТЕРАКТИВНЫЙ ЧАТ-БОТ
+# ЧАСТЬ 5: ИНТЕРАКТИВНЫЙ ЧАТ-БОТ
 # ============================================================
 
 print("\n" + "=" * 60)
-print("🤖 RAG ЧАТ-БОТ ЗАПУЩЕН!")
+print("RAG ЧАТ-БОТ ЗАПУЩЕН!")
 print("=" * 60)
 print("\nПримеры вопросов:")
-print("  • Что такое переобучение?")
-print("  • Как работает CatBoost?")
-print("  • Чем Precision отличается от Recall?")
-print("  • Что такое RAG?")
-print("  • Как бороться с переобучением?")
+print("  - Что такое переобучение?")
+print("  - Как работает CatBoost?")
+print("  - Чем Precision отличается от Recall?")
+print("  - Что такое RAG?")
+print("  - Как бороться с переобучением?")
 print("\nДля выхода напиши: выход, exit или quit")
 print("=" * 60)
 
@@ -197,11 +217,11 @@ print("=" * 60)
 while True:
     try:
         # Получаем вопрос от пользователя
-        question = input("\n❓ Ты: ").strip()
+        question = input("\nТы: ").strip()
         
         # Проверяем команды выхода
         if question.lower() in ["выход", "exit", "quit", "q"]:
-            print("\n👋 До свидания! Спасибо за использование RAG чат-бота.")
+            print("\nДо свидания! Спасибо за использование RAG чат-бота.")
             break
         
         # Пропускаем пустые вопросы
@@ -209,33 +229,31 @@ while True:
             continue
         
         # Показываем индикатор загрузки
-        print("\n🤔 Думаю...")
+        print("\nДумаю...")
         
-        # Вызываем RAG-цепочку
-        result = rag_chain.invoke({"input": question})
+        # Шаг 1: Ищем похожие документы в базе
+        context_documents = search_documents(question, k=2)
+        
+        # Шаг 2: Генерируем ответ на основе контекста
+        answer = generate_answer(question, context_documents)
         
         # Выводим ответ бота
-        print(f"\n🤖 Ассистент: {result['answer']}")
+        print(f"\nАссистент: {answer}")
         
-        # Показываем источники (найденные документы)
-        print("\n📚 Источники информации:")
-        for i, doc in enumerate(result['context'], 1):
-            # Обрезаем длинные документы для читаемости
-            content = doc.page_content
-            if len(content) > 100:
-                content = content[:100] + "..."
+        # Показываем источники
+        print("\nИсточники информации:")
+        for i, doc in enumerate(context_documents, 1):
+            content = doc if len(doc) <= 100 else doc[:100] + "..."
             print(f"  {i}. {content}")
         
-        # Разделитель между диалогами
+        # Разделитель
         print("\n" + "-" * 60)
         
     except KeyboardInterrupt:
-        # Обработка Ctrl+C
-        print("\n\n👋 До свидания!")
+        print("\n\nДо свидания!")
         break
     except Exception as e:
-        # Обработка ошибок
-        print(f"\n❌ Произошла ошибка: {e}")
+        print(f"\nПроизошла ошибка: {e}")
         print("Попробуй задать вопрос ещё раз.")
 
 # ============================================================
@@ -245,6 +263,6 @@ while True:
 print("\n" + "=" * 60)
 print("Сессия завершена")
 print("=" * 60)
-print(f"📊 Всего документов в базе: {collection.count()}")
-print(f"💾 Данные сохранены в: ./chroma_db")
+print(f"Всего документов в базе: {collection.count()}")
+print(f"Данные сохранены в: ./chroma_db")
 print("=" * 60)
